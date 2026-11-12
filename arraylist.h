@@ -11,3 +11,5 @@ typedef struct {
 void al_init(arraylist_t *L, unsigned capacity);
 void al_push(arraylist_t *L, char *item);   /* takes ownership; item may be NULL */
 void al_destroy(arraylist_t *L);            /* frees every item and the array */
+
+#endif

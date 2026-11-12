@@ -147,10 +147,15 @@ static void tokenize(const char *line, arraylist_t *tokens)
     }
 }
 
+/* qsort comparator for an array of char* (keeps glob output in order). */
+static int cmp_str(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+ 
 /* Expand one token that contains '*', pushing each match onto args.
  * If nothing matches, push a copy of the token unchanged.
  *
- * TODO:
  *  - Split at the last '/': directory part (or ".") and name pattern.
  *  - Split the pattern at '*' into prefix and suffix.
  *  - opendir()/readdir(): a name matches if
@@ -161,19 +166,75 @@ static void tokenize(const char *line, arraylist_t *tokens)
  */
 static void expand_wildcard(const char *token, arraylist_t *args)
 {
-    al_push(args, strdup(token));
+    const char *slash = strrchr(token, '/');
+    const char *pattern = slash ? slash + 1 : token;
+    const char *star = strchr(pattern, '*');
+ 
+    /* Only one '*' is allowed, and only in the last path component.
+     * Anything else is passed through literally. */
+    if (!star || strchr(star + 1, '*') ||
+        (slash && memchr(token, '*', (size_t)(slash - token)))) {
+        al_push(args, strdup(token));
+        return;
+    }
+ 
+    /* dirpart is what gets prepended to each match ("" or "baz/"). */
+    size_t dirlen = slash ? (size_t)(slash - token) + 1 : 0;
+    char *dirpart = strndup(token, dirlen);
+    char *prefix  = strndup(pattern, (size_t)(star - pattern));
+    const char *suffix = star + 1;
+    size_t plen = strlen(prefix), slen = strlen(suffix);
+    if (!dirpart || !prefix) { perror("strndup"); exit(EXIT_FAILURE); }
+ 
+    arraylist_t matches;
+    al_init(&matches, 8);
+ 
+    DIR *dir = opendir(dirlen ? dirpart : ".");
+    if (dir) {
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            const char *name = de->d_name;
+            size_t nlen = strlen(name);
+ 
+            if (plen == 0 && name[0] == '.') continue;   /* hidden files */
+            if (nlen < plen + slen) continue;
+            if (strncmp(name, prefix, plen) != 0) continue;
+            if (strcmp(name + nlen - slen, suffix) != 0) continue;
+ 
+            char *m = malloc(dirlen + nlen + 1);
+            if (!m) { perror("malloc"); exit(EXIT_FAILURE); }
+            memcpy(m, dirpart, dirlen);
+            memcpy(m + dirlen, name, nlen + 1);
+            al_push(&matches, m);
+        }
+        closedir(dir);
+    }
+ 
+    if (matches.length == 0) {
+        al_push(args, strdup(token));
+    } else {
+        qsort(matches.data, matches.length, sizeof(char *), cmp_str);
+        for (unsigned i = 0; i < matches.length; i++) {
+            al_push(args, matches.data[i]);   /* ownership moves to args */
+            matches.data[i] = NULL;
+        }
+    }
+ 
+    al_destroy(&matches);                     /* frees only NULLs now */
+    free(dirpart);
+    free(prefix);
 }
-
+ 
 static int is_special(const char *tok)
 {
     return !strcmp(tok, "<") || !strcmp(tok, ">") ||
            !strcmp(tok, ">>") || !strcmp(tok, "|");
 }
-
+ 
 /* Build job from tokens. Return 0 on success, -1 on syntax error
  * (after printing a message to stderr).
  *
- * TODO: walk the tokens:
+ * Walk the tokens:
  *  - "<", ">", ">>": the next token is the file name. Syntax error if it
  *    is missing or is_special(). Record in job->infile / outfile / append.
  *  - "|": syntax error if the current command has no args; otherwise
@@ -183,17 +244,80 @@ static int is_special(const char *tok)
  *  - At the end: syntax error if the last command has no args
  *    (e.g. "foo |").
  *  - Set exit_requested if any command's args[0] is "exit".
+ *
+ * The job is always left in a state free_job() can clean up, even after
+ * a syntax error.
  */
 static int parse_job(arraylist_t *tokens, job_t *job)
 {
-    (void)tokens; (void)is_special; (void)expand_wildcard;
-    job->cmds = NULL;
-    job->ncmds = 0;
     job->infile = job->outfile = NULL;
     job->append = 0;
+    job->ncmds = 1;
+    job->cmds = malloc(sizeof(cmd_t));
+    if (!job->cmds) { perror("malloc"); exit(EXIT_FAILURE); }
+    al_init(&job->cmds[0].args, 8);
+ 
+    for (unsigned i = 0; i < tokens->length; i++) {
+        const char *tok = tokens->data[i];
+        cmd_t *cur = &job->cmds[job->ncmds - 1];
+ 
+        if (!strcmp(tok, "<") || !strcmp(tok, ">") || !strcmp(tok, ">>")) {
+            if (i + 1 >= tokens->length) {
+                fprintf(stderr, "mysh: syntax error: expected file name after '%s'\n", tok);
+                return -1;
+            }
+            const char *file = tokens->data[++i];
+            if (is_special(file)) {
+                fprintf(stderr, "mysh: syntax error near unexpected token '%s'\n", file);
+                return -1;
+            }
+            char *copy = strdup(file);
+            if (!copy) { perror("strdup"); exit(EXIT_FAILURE); }
+ 
+            if (tok[0] == '<') {
+                free(job->infile);            /* last one wins */
+                job->infile = copy;
+            } else {
+                free(job->outfile);
+                job->outfile = copy;
+                job->append = (tok[1] == '>');
+            }
+ 
+        } else if (!strcmp(tok, "|")) {
+            if (cur->args.length == 0) {
+                fprintf(stderr, "mysh: syntax error near unexpected token '|'\n");
+                return -1;
+            }
+            cmd_t *p = realloc(job->cmds, (job->ncmds + 1) * sizeof(cmd_t));
+            if (!p) { perror("realloc"); exit(EXIT_FAILURE); }
+            job->cmds = p;
+            al_init(&job->cmds[job->ncmds].args, 8);
+            job->ncmds++;
+ 
+        } else if (strchr(tok, '*')) {
+            expand_wildcard(tok, &cur->args);
+ 
+        } else {
+            char *copy = strdup(tok);
+            if (!copy) { perror("strdup"); exit(EXIT_FAILURE); }
+            al_push(&cur->args, copy);
+        }
+    }
+ 
+    if (job->cmds[job->ncmds - 1].args.length == 0) {
+        fprintf(stderr, job->ncmds > 1
+                ? "mysh: syntax error: missing command after '|'\n"
+                : "mysh: syntax error: missing command\n");
+        return -1;
+    }
+ 
+    for (int i = 0; i < job->ncmds; i++)
+        if (!strcmp(job->cmds[i].args.data[0], "exit"))
+            exit_requested = 1;
+ 
     return 0;
 }
-
+ 
 static void free_job(job_t *job)
 {
     for (int i = 0; i < job->ncmds; i++) al_destroy(&job->cmds[i].args);
@@ -201,11 +325,11 @@ static void free_job(job_t *job)
     free(job->infile);
     free(job->outfile);
 }
-
+ 
 /* ------------------------------------------------------------------ */
 /* Program lookup and built-ins                                        */
 /* ------------------------------------------------------------------ */
-
+ 
 /* Return a malloc'd path to the executable for name, or NULL if there
  * is none. The caller frees the result.
  *
@@ -216,7 +340,7 @@ static char *find_program(const char *name)
 {
     if (strchr(name, '/'))
         return access(name, X_OK) == 0 ? strdup(name) : NULL;
-
+ 
     for (int i = 0; i < NUM_SEARCH_DIRS; i++) {
         size_t n = strlen(search_dirs[i]) + strlen(name) + 2;   /* '/' + '\0' */
         char *path = malloc(n);
@@ -227,13 +351,13 @@ static char *find_program(const char *name)
     }
     return NULL;
 }
-
+ 
 static int is_builtin(const char *name)
 {
     return !strcmp(name, "cd") || !strcmp(name, "pwd") ||
            !strcmp(name, "which") || !strcmp(name, "exit");
 }
-
+ 
 /* Run a built-in using the current stdin/stdout. argv[0] is the built-in's
  * name and argv[argc] == NULL. Return 0 on success, 1 on failure.
  * Output is flushed before returning, so the caller can restore fd 1
@@ -242,7 +366,7 @@ static int is_builtin(const char *name)
 static int run_builtin(int argc, char **argv)
 {
     int failed = 0;
-
+ 
     if (!strcmp(argv[0], "cd")) {
         const char *dir;
         if (argc > 2) {
@@ -259,7 +383,7 @@ static int run_builtin(int argc, char **argv)
             perror("cd");
             return 1;
         }
-
+ 
     } else if (!strcmp(argv[0], "pwd")) {
         char *cwd = get_cwd();
         if (!cwd) {
@@ -268,7 +392,7 @@ static int run_builtin(int argc, char **argv)
         }
         printf("%s\n", cwd);
         free(cwd);
-
+ 
     } else if (!strcmp(argv[0], "which")) {
         if (argc < 2) {
             fprintf(stderr, "which: missing argument\n");
@@ -286,50 +410,96 @@ static int run_builtin(int argc, char **argv)
         }
     }
     /* exit: nothing to do here; parse_job sets exit_requested. */
-
+ 
     if (fflush(stdout) != 0) failed = 1;
     return failed;
 }
-
+ 
 /* ------------------------------------------------------------------ */
 /* Execution                                                           */
 /* ------------------------------------------------------------------ */
-
+ 
 /* Open the job's redirection files.
  * On success set *in_fd / *out_fd (-1 = no redirection) and return 0.
  * On failure perror, close anything opened, and return -1.
  *
- * TODO:
  *  - infile:  open(O_RDONLY)
  *  - outfile: open(O_WRONLY|O_CREAT|(append ? O_APPEND : O_TRUNC), 0640)
  *  - In batch mode with no infile, open /dev/null as the input.
  */
 static int open_redirects(job_t *job, int *in_fd, int *out_fd)
 {
-    (void)job;
     *in_fd = *out_fd = -1;
+ 
+    if (job->infile) {
+        *in_fd = open(job->infile, O_RDONLY);
+        if (*in_fd < 0) {
+            perror(job->infile);
+            return -1;
+        }
+    } else if (!interactive) {
+        *in_fd = open("/dev/null", O_RDONLY);
+        if (*in_fd < 0) {
+            perror("/dev/null");
+            return -1;
+        }
+    }
+ 
+    if (job->outfile) {
+        int flags = O_WRONLY | O_CREAT | (job->append ? O_APPEND : O_TRUNC);
+        *out_fd = open(job->outfile, flags, S_IRUSR | S_IWUSR | S_IRGRP);
+        if (*out_fd < 0) {
+            perror(job->outfile);
+            if (*in_fd != -1) close(*in_fd);
+            *in_fd = -1;
+            return -1;
+        }
+    }
+ 
     return 0;
 }
-
+ 
 /* Code that runs in a forked child: wire up stdin/stdout, then become
  * the program (or run the built-in and exit). Never returns.
  *
- * TODO:
  *  - dup2(in_fd, 0) / dup2(out_fd, 1) when they are not -1, then close
- *    the originals (and every other pipe fd the child inherited!).
+ *    the originals. (execute_job closes every other pipe fd the child
+ *    inherited before calling this.)
  *  - Built-in: exit(run_builtin(argc, argv)).
  *  - Otherwise find_program(); if NULL print "name: command not found"
  *    and exit(1). Then execv(path, argv); if it returns, perror and exit(1).
  */
 static void child_exec(cmd_t *cmd, int in_fd, int out_fd)
 {
-    (void)cmd; (void)in_fd; (void)out_fd; (void)is_builtin;
+    if (in_fd != -1 && in_fd != STDIN_FILENO) {
+        if (dup2(in_fd, STDIN_FILENO) < 0) { perror("dup2"); exit(EXIT_FAILURE); }
+        close(in_fd);
+    }
+    if (out_fd != -1 && out_fd != STDOUT_FILENO) {
+        if (dup2(out_fd, STDOUT_FILENO) < 0) { perror("dup2"); exit(EXIT_FAILURE); }
+        close(out_fd);
+    }
+ 
+    int    argc = (int)cmd->args.length - 1;
+    char **argv = cmd->args.data;
+ 
+    if (is_builtin(argv[0]))
+        exit(run_builtin(argc, argv));
+ 
+    char *path = find_program(argv[0]);
+    if (!path) {
+        fprintf(stderr, "%s: command not found\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+ 
+    execv(path, argv);
+    perror(argv[0]);
+    free(path);
     exit(EXIT_FAILURE);
 }
-
+ 
 /* Run a parsed job. Return 1 if it succeeded, 0 if it failed.
  *
- * TODO:
  *  1. NULL-terminate each command's args: al_push(&args, NULL).
  *     (argc is then args.length - 1, argv is args.data.)
  *  2. open_redirects(); fail the job if it returns -1.
@@ -349,15 +519,125 @@ static void child_exec(cmd_t *cmd, int in_fd, int out_fd)
  */
 static int execute_job(job_t *job)
 {
-    (void)job; (void)open_redirects; (void)child_exec; (void)run_builtin;
-    return 1;
+    int in_fd, out_fd;
+ 
+    /* 1. argv arrays must end in NULL for execv(). */
+    for (int i = 0; i < job->ncmds; i++)
+        al_push(&job->cmds[i].args, NULL);
+ 
+    /* 2. Redirection files. */
+    if (open_redirects(job, &in_fd, &out_fd) < 0)
+        return 0;
+ 
+    /* 3. A lone built-in runs in the shell itself. */
+    if (job->ncmds == 1 && is_builtin(job->cmds[0].args.data[0])) {
+        cmd_t *cmd = &job->cmds[0];
+        int saved_in = -1, saved_out = -1, result;
+ 
+        fflush(stdout);
+        if (in_fd != -1) {
+            saved_in = dup(STDIN_FILENO);
+            dup2(in_fd, STDIN_FILENO);
+            close(in_fd);
+        }
+        if (out_fd != -1) {
+            saved_out = dup(STDOUT_FILENO);
+            dup2(out_fd, STDOUT_FILENO);
+            close(out_fd);
+        }
+ 
+        result = run_builtin((int)cmd->args.length - 1, cmd->args.data);
+ 
+        if (saved_in != -1) {
+            dup2(saved_in, STDIN_FILENO);
+            close(saved_in);
+        }
+        if (saved_out != -1) {
+            dup2(saved_out, STDOUT_FILENO);
+            close(saved_out);
+        }
+        return result == 0;
+    }
+ 
+    /* 4. Start every process in the pipeline. */
+    pid_t *pids = malloc(job->ncmds * sizeof(pid_t));
+    if (!pids) { perror("malloc"); exit(EXIT_FAILURE); }
+    int started = 0;
+    int failed = 0;
+    int prev_read = in_fd;          /* stdin for the next child */
+ 
+    for (int i = 0; i < job->ncmds; i++) {
+        int last = (i == job->ncmds - 1);
+        int pfd[2] = { -1, -1 };
+ 
+        if (!last && pipe(pfd) < 0) {
+            perror("pipe");
+            failed = 1;
+            break;
+        }
+ 
+        int child_in  = prev_read;
+        int child_out = last ? out_fd : pfd[1];
+ 
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            if (!last) { close(pfd[0]); close(pfd[1]); }
+            failed = 1;
+            break;
+        }
+ 
+        if (pid == 0) {
+            /* Close fds this child does not use, so readers see EOF. */
+            if (!last) close(pfd[0]);
+            if (!last && out_fd != -1) close(out_fd);
+            child_exec(&job->cmds[i], child_in, child_out);
+        }
+ 
+        pids[started++] = pid;
+ 
+        /* Parent: done with this child's stdin and the pipe's write end. */
+        if (prev_read != -1) close(prev_read);
+        if (!last) close(pfd[1]);
+        prev_read = last ? -1 : pfd[0];
+    }
+ 
+    /* Anything still open after an early break, plus the output file. */
+    if (prev_read != -1) close(prev_read);
+    if (out_fd != -1) close(out_fd);
+ 
+    /* 5. Reap every child; remember how the last one finished. */
+    int status = 0, last_status = 0;
+    for (int i = 0; i < started; i++) {
+        while (waitpid(pids[i], &status, 0) < 0) {
+            if (errno != EINTR) { perror("waitpid"); break; }
+        }
+        if (i == job->ncmds - 1) last_status = status;
+    }
+    free(pids);
+ 
+    /* The last command never started, so the job failed. */
+    if (failed || started < job->ncmds)
+        return 0;
+ 
+    /* 6. Report the result. */
+    if (WIFEXITED(last_status)) {
+        int code = WEXITSTATUS(last_status);
+        if (code != 0 && interactive)
+            printf("Exited with status %d\n", code);
+        return code == 0;
+    }
+    if (WIFSIGNALED(last_status) && interactive)
+        printf("Terminated by signal: %s\n", strsignal(WTERMSIG(last_status)));
+    return 0;
 }
-
-
+ 
+ 
 int main(int argc, char **argv)
 {
     input_t in = { .fd = STDIN_FILENO, .pos = 0, .len = 0 };
-
+ 
     if (argc > 2) {
         fprintf(stderr, "usage: %s [script]\n", argv[0]);
         return EXIT_FAILURE;
@@ -368,30 +648,30 @@ int main(int argc, char **argv)
     } else {
         interactive = isatty(STDIN_FILENO);
     }
-
+ 
     if (interactive) printf("Welcome to my shell!\n");
-
+ 
     while (!exit_requested) {
         if (interactive) print_prompt();
-
+ 
         char *line = next_line(&in);
         if (!line) break;                     /* end of input */
-
+ 
         arraylist_t tokens;
         al_init(&tokens, 8);
         tokenize(line, &tokens);
-
+ 
         if (tokens.length > 0) {              /* skip empty/comment lines */
             job_t job;
             if (parse_job(&tokens, &job) == 0)
                 execute_job(&job);
             free_job(&job);
         }
-
+ 
         al_destroy(&tokens);
         free(line);
     }
-
+ 
     if (interactive) printf("Exiting my shell.\n");
     if (in.fd != STDIN_FILENO) close(in.fd);
     return EXIT_SUCCESS;
